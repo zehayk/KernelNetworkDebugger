@@ -1,0 +1,44 @@
+; knd.inf - optional installer for the knd capture driver.
+;
+; This is a non-PnP, software-only WFP callout driver. The simplest and most
+; reliable load path in the lab is `sc create` + `sc start` (see docs/BUILD.md);
+; this INF is provided for completeness / right-click "Install".
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = ActivityMonitor
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+Provider    = %ProviderName%
+DriverVer   =
+CatalogFile = knd.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12   ; %windir%\System32\drivers
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles]
+knd.sys = 1
+
+[DefaultInstall.NT$ARCH$]
+CopyFiles = knd.CopyFiles
+
+[knd.CopyFiles]
+knd.sys
+
+[DefaultInstall.NT$ARCH$.Services]
+AddService = knd,0x00000002,knd.Service   ; 0x2 = SPSVCINST_ASSOCSERVICE
+
+[knd.Service]
+DisplayName   = %ServiceName%
+ServiceType   = 1                 ; SERVICE_KERNEL_DRIVER
+StartType     = 3                 ; SERVICE_DEMAND_START
+ErrorControl  = 1                 ; SERVICE_ERROR_NORMAL
+ServiceBinary = %12%\knd.sys
+
+[Strings]
+ProviderName = "knd"
+ServiceName  = "knd network capture"
+DiskName     = "knd Install Disk"
