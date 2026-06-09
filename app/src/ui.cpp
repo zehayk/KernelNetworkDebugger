@@ -3,6 +3,7 @@
 #include "http_parse.h"
 #include "knd_service.h"
 #include "win_integration.h"
+#include "knd_inject.h"
 
 #include "imgui.h"
 #include "imgui_internal.h"   // DockBuilder*
@@ -127,9 +128,11 @@ static void BuildDefaultLayout(ImGuiID dockId)
 
     ImGui::DockBuilderDockWindow("Control",    top);
     ImGui::DockBuilderDockWindow("Flows",      left);
+    ImGui::DockBuilderDockWindow("Packets",    left);
     ImGui::DockBuilderDockWindow("Inspector",  rtop);
     ImGui::DockBuilderDockWindow("Statistics", rbot);
     ImGui::DockBuilderDockWindow("MITM",       rbot);
+    ImGui::DockBuilderDockWindow("SChannel keys", rbot);
     ImGui::DockBuilderDockWindow("Settings",   rbot);
     ImGui::DockBuilderFinish(dockId);
 }
@@ -160,7 +163,7 @@ static void DrawMenuBar(AppState& st, KndClient& client, KndModel& model)
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("View")) {
-        if (ImGui::MenuItem("Reset layout")) { st.resetLayout = true; }
+        if (ImGui::MenuItem("Reset layout")) { st.askResetLayout = true; }
         ImGui::EndMenu();
     }
     ImGui::EndMainMenuBar();
@@ -498,6 +501,38 @@ static void DrawHttpMessage(const char* base, const HttpMessage& m, bool isReq)
     }
 }
 
+static void RenderHttpTransactions(const char* idp, const std::vector<HttpMessage>& reqs,
+                                   const std::vector<HttpMessage>& resps)
+{
+    size_t count = reqs.size() > resps.size() ? reqs.size() : resps.size();
+    char childId[32];
+    std::snprintf(childId, sizeof(childId), "%s_scroll", idp);
+    ImGui::BeginChild(childId, ImVec2(0, 0));
+    for (size_t i = 0; i < count; ++i) {
+        char tx[96];
+        if (i < reqs.size()) {
+            std::snprintf(tx, sizeof(tx), "Transaction %zu  —  %s %s###%s%zu",
+                          i + 1, reqs[i].method.c_str(), reqs[i].target.c_str(), idp, i);
+        } else {
+            std::snprintf(tx, sizeof(tx), "Transaction %zu###%s%zu", i + 1, idp, i);
+        }
+        if (ImGui::CollapsingHeader(tx, ImGuiTreeNodeFlags_DefaultOpen)) {
+            char base[40];
+            if (i < reqs.size()) {
+                ImGui::SeparatorText("Request");
+                std::snprintf(base, sizeof(base), "%srq%zu", idp, i);
+                DrawHttpMessage(base, reqs[i], true);
+            }
+            if (i < resps.size()) {
+                ImGui::SeparatorText("Response");
+                std::snprintf(base, sizeof(base), "%srs%zu", idp, i);
+                DrawHttpMessage(base, resps[i], false);
+            }
+        }
+    }
+    ImGui::EndChild();
+}
+
 static void DrawInspector(KndModel& model, AppState& st)
 {
     if (!ImGui::Begin("Inspector")) { ImGui::End(); return; }
@@ -533,34 +568,57 @@ static void DrawInspector(KndModel& model, AppState& st)
         if (ImGui::BeginTabItem("HTTP")) {
             if (reqs.empty() && resps.empty()) {
                 ImGui::TextDisabled("No HTTP detected in this stream.");
-                ImGui::TextWrapped("Likely encrypted TLS (decryption arrives in Phase 2) or a "
-                                   "non-HTTP protocol. Use the Raw tab to view the bytes.");
+                ImGui::TextWrapped("Likely encrypted TLS or a non-HTTP protocol. Use the Raw tab for "
+                                   "the bytes, or the Decrypted tab with a keylog loaded.");
             } else {
-                size_t count = reqs.size() > resps.size() ? reqs.size() : resps.size();
-                ImGui::BeginChild("http_scroll", ImVec2(0, 0));
-                for (size_t i = 0; i < count; ++i) {
-                    char tx[96];
-                    if (i < reqs.size()) {
-                        std::snprintf(tx, sizeof(tx), "Transaction %zu  —  %s %s###tx%zu",
-                                      i + 1, reqs[i].method.c_str(), reqs[i].target.c_str(), i);
+                RenderHttpTransactions("http", reqs, resps);
+            }
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Decrypted")) {
+            if (!st.keylogLoaded) {
+                ImGui::TextDisabled("Load a keylog in the 'SChannel keys' panel to decrypt TLS 1.2 here.");
+            } else {
+                static uint64_t dFlow = 0;
+                static size_t dOut = SIZE_MAX, dIn = SIZE_MAX, dKeys = SIZE_MAX;
+                static TlsDecryptResult dres;
+                static std::vector<HttpMessage> dreq, dresp;
+                if (f->flowId != dFlow || f->payload[0].size() != dOut ||
+                    f->payload[1].size() != dIn || st.keylog.size() != dKeys) {
+                    dres = TlsDecryptFlow(f->payload[0], f->payload[1], st.keylog);
+                    if (dres.ok) {
+                        dreq = HttpParse(dres.outPlain, false);
+                        dresp = HttpParse(dres.inPlain, true);
                     } else {
-                        std::snprintf(tx, sizeof(tx), "Transaction %zu###tx%zu", i + 1, i);
+                        dreq.clear(); dresp.clear();
                     }
-                    if (ImGui::CollapsingHeader(tx, ImGuiTreeNodeFlags_DefaultOpen)) {
-                        char base[32];
-                        if (i < reqs.size()) {
-                            ImGui::SeparatorText("Request");
-                            std::snprintf(base, sizeof(base), "rq%zu", i);
-                            DrawHttpMessage(base, reqs[i], true);
+                    dFlow = f->flowId; dOut = f->payload[0].size();
+                    dIn = f->payload[1].size(); dKeys = st.keylog.size();
+                }
+                if (!dres.ok) {
+                    ImGui::TextColored(ImVec4(0.95f, 0.6f, 0.3f, 1.0f), "%s", dres.note.c_str());
+                } else {
+                    ImGui::TextDisabled("decrypted %zu B out / %zu B in  (suite 0x%04x)",
+                                        dres.outPlain.size(), dres.inPlain.size(), dres.cipherSuite);
+                    if (dreq.empty() && dresp.empty()) {
+                        ImGui::BeginChild("dec_raw", ImVec2(0, 0), ImGuiChildFlags_Borders,
+                                          ImGuiWindowFlags_HorizontalScrollbar);
+                        if (!dres.outPlain.empty()) {
+                            ImGui::TextDisabled("-> outbound");
+                            ImGui::TextUnformatted((const char*)dres.outPlain.data(),
+                                                   (const char*)dres.outPlain.data() + dres.outPlain.size());
                         }
-                        if (i < resps.size()) {
-                            ImGui::SeparatorText("Response");
-                            std::snprintf(base, sizeof(base), "rs%zu", i);
-                            DrawHttpMessage(base, resps[i], false);
+                        if (!dres.inPlain.empty()) {
+                            ImGui::TextDisabled("<- inbound");
+                            ImGui::TextUnformatted((const char*)dres.inPlain.data(),
+                                                   (const char*)dres.inPlain.data() + dres.inPlain.size());
                         }
+                        ImGui::EndChild();
+                    } else {
+                        RenderHttpTransactions("dec", dreq, dresp);
                     }
                 }
-                ImGui::EndChild();
             }
             ImGui::EndTabItem();
         }
@@ -596,53 +654,187 @@ static void DrawInspector(KndModel& model, AppState& st)
     ImGui::End();
 }
 
+static bool InfoMatch(const std::string& info, const std::string& needleLower)
+{
+    if (needleLower.empty()) { return true; }
+    std::string h = info;
+    std::transform(h.begin(), h.end(), h.begin(), [](unsigned char c) { return (char)::tolower(c); });
+    return h.find(needleLower) != std::string::npos;
+}
+
+static void DrawPackets(KndModel& model, AppState& st)
+{
+    if (!ImGui::Begin("Packets")) { ImGui::End(); return; }
+
+    ImGui::SetNextItemWidth(260);
+    ImGui::InputTextWithHint("##pf", "filter info (process / host / text)...",
+                             st.packetFilter, sizeof(st.packetFilter));
+    ImGui::SameLine();
+    const auto& pkts = model.packets();
+    ImGui::TextDisabled("(%zu packets)", pkts.size());
+
+    std::string nf = st.packetFilter;
+    std::transform(nf.begin(), nf.end(), nf.begin(), [](unsigned char c) { return (char)::tolower(c); });
+    bool filtering = !nf.empty();
+
+    std::vector<const KndPacket*> view;
+    view.reserve(pkts.size());
+    for (const auto& p : pkts) { if (!filtering || InfoMatch(p.info, nf)) { view.push_back(&p); } }
+
+    ImGui::BeginChild("pkt_list", ImVec2(0, -170));
+    const ImGuiTableFlags tf = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                               ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+                               ImGuiTableFlags_SizingStretchProp;
+    if (ImGui::BeginTable("packets", 6, tf)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("No.",  ImGuiTableColumnFlags_WidthFixed, 64);
+        ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 96);
+        ImGui::TableSetupColumn("Flow", ImGuiTableColumnFlags_WidthFixed, 64);
+        ImGui::TableSetupColumn("Dir",  ImGuiTableColumnFlags_WidthFixed, 40);
+        ImGui::TableSetupColumn("Len",  ImGuiTableColumnFlags_WidthFixed, 64);
+        ImGui::TableSetupColumn("Info", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableHeadersRow();
+
+        ImGuiListClipper clipper;
+        clipper.Begin((int)view.size());
+        while (clipper.Step()) {
+            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+                const KndPacket* p = view[i];
+                ImGui::TableNextRow();
+                if (p->type == KND_REC_CONN_OPEN) {
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(40, 90, 50, 60));
+                } else if (p->type == KND_REC_CONN_CLOSE) {
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(70, 70, 70, 50));
+                } else if (p->direction == KND_DIR_INBOUND) {
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, IM_COL32(40, 60, 90, 40));
+                }
+
+                ImGui::TableSetColumnIndex(0);
+                char lbl[40];
+                std::snprintf(lbl, sizeof(lbl), "%llu##p%llu",
+                              (unsigned long long)p->no, (unsigned long long)p->no);
+                bool sel = (st.selectedPacket == p->no);
+                if (ImGui::Selectable(lbl, sel, ImGuiSelectableFlags_SpanAllColumns)) {
+                    st.selectedPacket = p->no;
+                }
+                ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(KndFormatTime(p->ts).c_str());
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%04llX", (unsigned long long)(p->flowId & 0xFFFF));
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(p->type != KND_REC_DATA ? "" :
+                                       (p->direction == KND_DIR_INBOUND ? "in" : "out"));
+                ImGui::TableSetColumnIndex(4);
+                if (p->type == KND_REC_DATA) { ImGui::Text("%u", p->length); }
+                ImGui::TableSetColumnIndex(5); ImGui::TextUnformatted(p->info.c_str());
+            }
+        }
+        ImGui::EndTable();
+    }
+    ImGui::EndChild();
+
+    ImGui::Separator();
+    const KndPacket* selp = nullptr;
+    for (const auto& p : pkts) { if (p.no == st.selectedPacket) { selp = &p; break; } }
+    if (selp == nullptr) {
+        ImGui::TextDisabled("Select a packet to see its bytes.");
+    } else {
+        ImGui::Text("#%llu  %s", (unsigned long long)selp->no, selp->info.c_str());
+        if (!selp->preview.empty()) {
+            ImGui::TextDisabled("preview (first %zu bytes; full stream in Inspector)", selp->preview.size());
+            ImGui::BeginChild("pkt_hex", ImVec2(0, 0), ImGuiChildFlags_Borders);
+            DrawHexDump(selp->preview);
+            ImGui::EndChild();
+        }
+    }
+    ImGui::End();
+}
+
 static void DrawStats(KndModel& model, KndClient& client, AppState& st)
 {
     if (!ImGui::Begin("Statistics")) { ImGui::End(); return; }
 
-    // update the throughput sparkline ~4x/sec
+    const KndModelStats& m = model.stats();
     const double now = ImGui::GetTime();
+
     if (now - st.lastThruTs >= 0.25) {
         double dt = (st.lastThruTs == 0.0) ? 0.25 : (now - st.lastThruTs);
-        uint64_t cur = model.stats().totalRecords;
-        st.thru[st.thruHead] = (float)((double)(cur - st.lastRecCount) / dt);
+        uint64_t cur = m.totalRecords;
+        uint64_t curB = m.outBytes + m.inBytes;
+        st.thru[st.thruHead]  = (float)((double)(cur - st.lastRecCount) / dt);
+        st.thruB[st.thruHead] = (float)((double)(curB - st.lastByteCount) / dt);
         st.thruHead = (st.thruHead + 1) % IM_ARRAYSIZE(st.thru);
         st.lastRecCount = cur;
+        st.lastByteCount = curB;
         st.lastThruTs = now;
     }
+    int last = (st.thruHead + IM_ARRAYSIZE(st.thru) - 1) % IM_ARRAYSIZE(st.thru);
 
-    char overlay[48];
-    std::snprintf(overlay, sizeof(overlay), "%.0f rec/s",
-                  st.thru[(st.thruHead + IM_ARRAYSIZE(st.thru) - 1) % IM_ARRAYSIZE(st.thru)]);
-    ImGui::PlotLines("##thru", st.thru, IM_ARRAYSIZE(st.thru), st.thruHead, overlay,
-                     0.0f, FLT_MAX, ImVec2(-1, 60));
+    ImGui::SeparatorText("Throughput");
+    char ov[48];
+    std::snprintf(ov, sizeof(ov), "%.0f rec/s", st.thru[last]);
+    ImGui::PlotLines("##thru", st.thru, IM_ARRAYSIZE(st.thru), st.thruHead, ov, 0.0f, FLT_MAX, ImVec2(-1, 55));
+    std::snprintf(ov, sizeof(ov), "%s/s", KndFormatBytes((uint64_t)st.thruB[last]).c_str());
+    ImGui::PlotLines("##thruB", st.thruB, IM_ARRAYSIZE(st.thruB), st.thruHead, ov, 0.0f, FLT_MAX, ImVec2(-1, 55));
+
+    ImGui::SeparatorText("Volume  (out / in)");
+    uint64_t tot = m.outBytes + m.inBytes;
+    float outFrac = tot ? (float)((double)m.outBytes / (double)tot) : 0.0f;
+    ImGui::ProgressBar(outFrac, ImVec2(-1, 0), ("out " + KndFormatBytes(m.outBytes)).c_str());
+    ImGui::ProgressBar(1.0f - outFrac, ImVec2(-1, 0), ("in  " + KndFormatBytes(m.inBytes)).c_str());
+
+    ImGui::SeparatorText("Packet sizes");
+    float hist[6];
+    for (int i = 0; i < 6; ++i) { hist[i] = (float)m.sizeHist[i]; }
+    ImGui::PlotHistogram("##sizes", hist, 6, 0, "<128  <512  <1500  <4k  <16k  16k+",
+                         0.0f, FLT_MAX, ImVec2(-1, 55));
 
     const KND_RING_HEADER* ring = client.ring();
     if (ring != nullptr) {
+        ImGui::SeparatorText("Kernel ring");
         uint64_t used = ring->writePos - ring->readPos;
         float fill = ring->dataSize ? (float)((double)used / (double)ring->dataSize) : 0.0f;
-        ImGui::Text("Kernel ring");
         ImGui::ProgressBar(fill, ImVec2(-1, 0),
                            (KndFormatBytes(used) + " / " + KndFormatBytes(ring->dataSize)).c_str());
         if (ring->droppedRecords > 0) {
-            ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1.0f),
-                               "dropped: %llu records / %s (ring was full — UI fell behind)",
+            ImGui::TextColored(ImVec4(0.95f, 0.45f, 0.35f, 1.0f), "dropped %llu rec / %s",
                                (unsigned long long)ring->droppedRecords,
                                KndFormatBytes(ring->droppedBytes).c_str());
-        } else {
-            ImGui::TextDisabled("dropped: 0");
         }
-    } else {
-        ImGui::TextDisabled("ring not mapped");
     }
 
-    ImGui::Separator();
-    const KndModelStats& m = model.stats();
-    ImGui::Text("records total : %llu", (unsigned long long)m.totalRecords);
-    ImGui::Text("conn open/close: %llu / %llu",
-                (unsigned long long)m.connOpens, (unsigned long long)m.connCloses);
-    ImGui::Text("data records  : %llu", (unsigned long long)m.dataRecords);
-    ImGui::Text("payload bytes : %s", KndFormatBytes(m.payloadBytes).c_str());
+    ImGui::SeparatorText("Top talkers");
+    const auto& flows = model.flows();
+    std::vector<const KndFlow*> top;
+    top.reserve(flows.size());
+    for (auto& f : flows) { top.push_back(&f); }
+    size_t showN = top.size() < 8 ? top.size() : 8;
+    std::partial_sort(top.begin(), top.begin() + showN, top.end(),
+        [](const KndFlow* a, const KndFlow* b) {
+            return (a->bytesIn + a->bytesOut) > (b->bytesIn + b->bytesOut);
+        });
+    if (ImGui::BeginTable("talkers", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
+                                         ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Process", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Remote",  ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn("Total",   ImGuiTableColumnFlags_WidthFixed, 80);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < showN; ++i) {
+            const KndFlow* f = top[i];
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(f->processName.empty() ? "(unknown)" : f->processName.c_str());
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%s:%u", KndFormatAddr(f->remoteAddr, f->ipVersion).c_str(), f->remotePort);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(KndFormatBytes(f->bytesIn + f->bytesOut).c_str());
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::SeparatorText("Totals");
+    ImGui::Text("records %llu   conns %llu/%llu   data %llu   payload %s",
+                (unsigned long long)m.totalRecords, (unsigned long long)m.connOpens,
+                (unsigned long long)m.connCloses, (unsigned long long)m.dataRecords,
+                KndFormatBytes(m.payloadBytes).c_str());
     ImGui::End();
 }
 
@@ -670,7 +862,9 @@ static void DrawSettings(AppState& st, KndClient& client)
     }
 
     ImGui::SeparatorText("Layout");
-    if (ImGui::Button("Reset layout")) { st.resetLayout = true; }
+    if (ImGui::Button("Reset layout")) { st.askResetLayout = true; }
+    ImGui::SameLine();
+    ImGui::TextDisabled("settings are saved automatically on exit");
 
     ImGui::SeparatorText("Device");
     ImGui::TextWrapped("%s", st.status);
@@ -679,7 +873,7 @@ static void DrawSettings(AppState& st, KndClient& client)
     ImGui::End();
 }
 
-static void DrawMitm(AppState& st, KndMitmCa& ca, KndMitmProxy& proxy)
+static void DrawMitm(AppState& st, KndClient& client, KndMitmCa& ca, KndMitmProxy& proxy)
 {
     if (!ImGui::Begin("MITM")) { ImGui::End(); return; }
 
@@ -728,6 +922,11 @@ static void DrawMitm(AppState& st, KndMitmCa& ca, KndMitmProxy& proxy)
     }
 
     ImGui::Checkbox("Set as Windows system proxy while running", &st.useSystemProxy);
+    if (ImGui::Checkbox("WFP transparent redirect (driver; no proxy settings)", &st.wfpRedirect)) {
+        client.setRedirect(st.wfpRedirect, (uint16_t)st.proxyPort);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(needs the driver loaded)");
     ImGui::TextDisabled("%s", st.mitmStatus);
 
     ImGui::SeparatorText("Certificate authority");
@@ -748,6 +947,60 @@ static void DrawMitm(AppState& st, KndMitmCa& ca, KndMitmProxy& proxy)
     ImGui::TextWrapped("Test without installing: curl --proxy 127.0.0.1:%d --cacert knd_ca.pem "
                        "https://example.com", st.proxyPort);
 
+    ImGui::End();
+}
+
+static void DrawStealth(AppState& st)
+{
+    if (!ImGui::Begin("SChannel keys")) { ImGui::End(); return; }
+
+    ImGui::TextWrapped("Stealth decryption: pull TLS session keys from lsass (where SChannel derives "
+                       "them) with NO hook in the analyzed app's process. Keys -> "
+                       "C:\\ProgramData\\knd_sslkeys.log (SSLKEYLOGFILE format). VM ONLY.");
+    ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.30f, 1.0f),
+                       "Needs admin + lsass NOT a PPL. Check:  reg query "
+                       "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa /v RunAsPPL");
+    ImGui::Separator();
+
+    std::wstring dll = KndInject::DefaultDllPath();
+    if (ImGui::Button("Inject into lsass", ImVec2(170, 0))) {
+        std::string e;
+        unsigned long pid = KndInject::FindProcessId(L"lsass.exe");
+        if (KndInject::InjectDll(pid, dll.c_str(), e)) {
+            snprintf(st.stealthStatus, sizeof(st.stealthStatus),
+                     "injected into lsass (pid %lu) - make TLS traffic, then check the keylog", pid);
+        } else {
+            snprintf(st.stealthStatus, sizeof(st.stealthStatus), "inject failed: %s", e.c_str());
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Unhook lsass", ImVec2(140, 0))) {
+        std::string e;
+        unsigned long pid = KndInject::FindProcessId(L"lsass.exe");
+        if (KndInject::UnhookDll(pid, dll.c_str(), e)) {
+            snprintf(st.stealthStatus, sizeof(st.stealthStatus), "unhooked + unloaded from lsass");
+        } else {
+            snprintf(st.stealthStatus, sizeof(st.stealthStatus), "unhook failed: %s", e.c_str());
+        }
+    }
+    ImGui::TextDisabled("%s", st.stealthStatus);
+
+    ImGui::Separator();
+    ImGui::TextWrapped("First captures dump the key object to C:\\ProgramData\\knd_sslkeys_calib.log so "
+                       "the master-secret offset can be confirmed for your Windows build. TLS 1.2 first; "
+                       "1.3 once calibrated.");
+
+    ImGui::SeparatorText("Offline decryption (keylog)");
+    ImGui::SetNextItemWidth(320);
+    ImGui::InputText("##keylogpath", st.keylogPath, sizeof(st.keylogPath));
+    ImGui::SameLine();
+    if (ImGui::Button("Load keylog")) {
+        st.keylog = TlsKeyLog();
+        st.keylog.loadFile(st.keylogPath);
+        st.keylogLoaded = st.keylog.size() > 0;
+        snprintf(st.keylogStatus, sizeof(st.keylogStatus), "keylog: %zu keys loaded", st.keylog.size());
+    }
+    ImGui::TextDisabled("%s  (drives the Inspector 'Decrypted' tab on TLS 1.2 flows)", st.keylogStatus);
     ImGui::End();
 }
 
@@ -772,8 +1025,26 @@ void Ui_Frame(KndModel& model, KndClient& client, KndMitmCa& ca, KndMitmProxy& p
 
     DrawControl(st, client, model);
     DrawFlows(model, st);
+    DrawPackets(model, st);
     DrawInspector(model, st);
     DrawStats(model, client, st);
-    DrawMitm(st, ca, proxy);
+    DrawMitm(st, client, ca, proxy);
+    DrawStealth(st);
     DrawSettings(st, client);
+
+    // reset-layout confirmation
+    if (st.askResetLayout) { ImGui::OpenPopup("Reset layout?"); st.askResetLayout = false; }
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if (ImGui::BeginPopupModal("Reset layout?", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextUnformatted("Discard the current window layout and restore the default?");
+        ImGui::Separator();
+        if (ImGui::Button("Yes, reset", ImVec2(120, 0))) {
+            st.resetLayout = true;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel", ImVec2(120, 0))) { ImGui::CloseCurrentPopup(); }
+        ImGui::EndPopup();
+    }
 }

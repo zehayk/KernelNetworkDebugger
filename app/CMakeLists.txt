@@ -18,6 +18,9 @@ add_executable(knetdbg WIN32
     src/mitm_proxy.cpp
     src/knd_service.cpp
     src/win_integration.cpp
+    src/settings.cpp
+    src/knd_inject.cpp
+    src/tls_decrypt.cpp
     # vendored Dear ImGui (docking branch) + Win32/DX11 backends
     ${IMGUI_DIR}/imgui.cpp
     ${IMGUI_DIR}/imgui_draw.cpp
@@ -61,3 +64,18 @@ add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../external/mbedtls
 # Step-0 spike target (not part of the default build).
 add_executable(tls_spike src/tls_spike.cpp)
 target_link_libraries(tls_spike PRIVATE mbedtls mbedx509 mbedcrypto)
+
+# TLS decryptor round-trip self-test (not part of the default build).
+add_executable(tls_test src/tls_test.cpp src/tls_decrypt.cpp)
+target_link_libraries(tls_test PRIVATE mbedcrypto)
+target_include_directories(tls_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../external/mbedtls/include)
+
+# --- MinHook + lsass SChannel key-extractor DLL (injected into lsass; VM only) ---
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../external/minhook
+                 ${CMAKE_BINARY_DIR}/minhook EXCLUDE_FROM_ALL)
+add_library(knd_sslkeys SHARED src/knd_sslkeys.cpp)
+target_link_libraries(knd_sslkeys PRIVATE minhook)
+target_include_directories(knd_sslkeys PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../external/minhook/include)

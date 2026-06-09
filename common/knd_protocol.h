@@ -61,6 +61,9 @@
 #define IOCTL_KND_START_CAPTURE  KND_IOCTL(0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_KND_STOP_CAPTURE   KND_IOCTL(0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_KND_GET_STATS      KND_IOCTL(0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Enable/disable WFP transparent connect-redirect of outbound :443/:80 to the
+ * local MITM proxy (no system proxy settings). IN = KND_REDIRECT_IN. */
+#define IOCTL_KND_SET_REDIRECT   KND_IOCTL(0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
 /* Scoped physical read/write of the driver's OWN cache region only.
  * 'offset' is an offset into the mapped cache region, NOT an arbitrary PA.
  * The driver validates 0 <= offset, offset+length <= totalSize, length <= KND_MAX_PHYS_RW,
@@ -188,6 +191,23 @@ typedef struct _KND_MAP_RING_OUT {
     ULONG     dataOffset;  /* == KND_RING_DATA_OFFSET */
     ULONG     dataSize;
 } KND_MAP_RING_OUT;
+
+/* IN for IOCTL_KND_SET_REDIRECT. */
+typedef struct _KND_REDIRECT_IN {
+    ULONG  enable;       /* 0/1 */
+    USHORT proxyPort;    /* host byte order */
+    USHORT reserved;
+} KND_REDIRECT_IN;
+
+/* The localRedirectContext the driver attaches to a redirected connection; the
+ * proxy reads it back via SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT to recover the
+ * original destination it must connect to. */
+typedef struct _KND_REDIRECT_CTX {
+    UCHAR  ipVersion;     /* KND_IPV4 / KND_IPV6 */
+    UCHAR  reserved;
+    USHORT origPort;      /* host byte order */
+    UCHAR  origAddr[16];  /* network order; IPv4 in [0..3] */
+} KND_REDIRECT_CTX;
 
 typedef struct _KND_STATS_OUT {
     ULONGLONG writePos;

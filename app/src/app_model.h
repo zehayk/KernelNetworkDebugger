@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <deque>
 #include <unordered_map>
 
 // One captured connection.
@@ -46,6 +47,21 @@ struct KndModelStats {
     uint64_t connCloses   = 0;
     uint64_t dataRecords  = 0;
     uint64_t payloadBytes = 0;
+    uint64_t outBytes     = 0;
+    uint64_t inBytes      = 0;
+    uint64_t sizeHist[6]  = { 0, 0, 0, 0, 0, 0 };  // <128,<512,<1500,<4k,<16k,>=16k
+};
+
+// One entry in the chronological packet log (the Wireshark-style view).
+struct KndPacket {
+    uint64_t             no = 0;       // monotonic packet number
+    int64_t              ts = 0;       // 100ns ticks
+    uint64_t             flowId = 0;
+    uint16_t             type = 0;     // KND_REC_*
+    uint8_t              direction = 0;
+    uint32_t             length = 0;   // payload length (KND_REC_DATA)
+    std::string          info;         // human summary
+    std::vector<uint8_t> preview;      // up to 64 payload bytes for the detail pane
 };
 
 class KndModel {
@@ -59,17 +75,24 @@ public:
     KndFlow* find(uint64_t flowId);
 
     const KndModelStats& stats() const { return stats_; }
+    const std::deque<KndPacket>& packets() const { return packets_; }
 
     // Per-flow payload cap (bytes, each direction). Changing it only affects
     // future appends.
     size_t payloadCap = 4u * 1024u * 1024u;
+    // Max packets retained in the chronological log (oldest dropped past this).
+    size_t packetCap  = 50000;
 
 private:
     KndFlow& getOrCreate(uint64_t flowId, double now);
+    void     pushPacket(const KND_RECORD* rec, const KndFlow& f, uint8_t dir,
+                        uint32_t len, const uint8_t* data);
 
     std::vector<KndFlow>                 flows_;
     std::unordered_map<uint64_t, size_t> index_;   // flowId -> flows_ index
     KndModelStats                        stats_;
+    std::deque<KndPacket>                packets_;
+    uint64_t                             packetNo_ = 0;
 };
 
 // ---- formatting helpers (shared with the UI) ----

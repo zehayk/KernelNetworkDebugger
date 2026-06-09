@@ -212,6 +212,15 @@ KndDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
         status = STATUS_SUCCESS;
         break;
 
+    case IOCTL_KND_SET_REDIRECT: {
+        if (inLen < sizeof(KND_REDIRECT_IN)) { status = STATUS_BUFFER_TOO_SMALL; break; }
+        KND_REDIRECT_IN* rq = (KND_REDIRECT_IN*)sysBuf;
+        ctx->RedirectPort = rq->proxyPort;
+        InterlockedExchange(&ctx->RedirectEnable, rq->enable ? 1 : 0);
+        status = STATUS_SUCCESS;
+        break;
+    }
+
     case IOCTL_KND_GET_STATS: {
         if (outLen < sizeof(KND_STATS_OUT)) { status = STATUS_BUFFER_TOO_SMALL; break; }
         if (ctx->Ring == NULL) { status = STATUS_DEVICE_NOT_READY; break; }

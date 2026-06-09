@@ -58,6 +58,12 @@ KndRingCreate(_Inout_ PKND_DEVICE_CONTEXT ctx, _In_ ULONG dataSize)
 VOID
 KndRingDestroy(_Inout_ PKND_DEVICE_CONTEXT ctx)
 {
+    /* Safety net: never unmap+free the ring while a usermode mapping is still live
+     * (it would pull pages out from under the consumer). A normal unload has already
+     * run IRP_MJ_CLEANUP, which unmaps and clears UserVa. */
+    if (ctx->UserVa != NULL) {
+        return;
+    }
     if (ctx->RingMdl != NULL) {
         IoFreeMdl(ctx->RingMdl);
         ctx->RingMdl = NULL;

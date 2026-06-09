@@ -109,6 +109,46 @@ void KndModel::clear()
     flows_.clear();
     index_.clear();
     stats_ = KndModelStats{};
+    packets_.clear();
+    packetNo_ = 0;
+}
+
+void KndModel::pushPacket(const KND_RECORD* rec, const KndFlow& f, uint8_t dir,
+                          uint32_t len, const uint8_t* data)
+{
+    KndPacket p;
+    p.no = ++packetNo_;
+    p.ts = rec->timestamp;
+    p.flowId = f.flowId;
+    p.type = rec->type;
+    p.direction = dir;
+    p.length = len;
+
+    const char* proc = f.processName.empty() ? "" : f.processName.c_str();
+    std::string remote = KndFormatAddr(f.remoteAddr, f.ipVersion);
+    char head[160];
+
+    if (rec->type == KND_REC_CONN_OPEN) {
+        std::snprintf(head, sizeof(head), "Connect  %s:%u  %s", remote.c_str(), f.remotePort, proc);
+        p.info = head;
+    } else if (rec->type == KND_REC_CONN_CLOSE) {
+        std::snprintf(head, sizeof(head), "Close  %s:%u", remote.c_str(), f.remotePort);
+        p.info = head;
+    } else {
+        uint32_t pv = (len < 64) ? len : 64;
+        if (data != nullptr && pv > 0) { p.preview.assign(data, data + pv); }
+        std::string text;
+        for (uint32_t i = 0; i < pv && i < 48; ++i) {
+            unsigned char c = data[i];
+            text += (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+        }
+        const char* arrow = (dir == KND_DIR_INBOUND) ? "<-" : "->";
+        std::snprintf(head, sizeof(head), "%s  %u B  ", arrow, len);
+        p.info = std::string(head) + text;
+    }
+
+    packets_.push_back(std::move(p));
+    if (packets_.size() > packetCap) { packets_.pop_front(); }
 }
 
 void KndModel::ingest(const KND_RECORD* rec, double now)
@@ -137,6 +177,7 @@ void KndModel::ingest(const KND_RECORD* rec, double now)
             f.processName = (slash == std::string::npos) ? f.processPath
                                                          : f.processPath.substr(slash + 1);
         }
+        pushPacket(rec, f, f.direction, 0, nullptr);
         stats_.connOpens++;
         break;
     }
@@ -148,6 +189,7 @@ void KndModel::ingest(const KND_RECORD* rec, double now)
         f.bytesIn  = p->bytesIn;
         f.bytesOut = p->bytesOut;
         f.lastTs = rec->timestamp;
+        pushPacket(rec, f, 0, 0, nullptr);
         stats_.connCloses++;
         break;
     }
@@ -173,6 +215,13 @@ void KndModel::ingest(const KND_RECORD* rec, double now)
             f.truncated[dir] = true;
         }
 
+        if (dir == 1) { stats_.inBytes += dp->dataLength; } else { stats_.outBytes += dp->dataLength; }
+        {
+            uint32_t L = dp->dataLength;
+            int b = (L < 128) ? 0 : (L < 512) ? 1 : (L < 1500) ? 2 : (L < 4096) ? 3 : (L < 16384) ? 4 : 5;
+            stats_.sizeHist[b]++;
+        }
+        pushPacket(rec, f, dp->direction, dp->dataLength, data);
         stats_.dataRecords++;
         stats_.payloadBytes += dp->dataLength;
         break;

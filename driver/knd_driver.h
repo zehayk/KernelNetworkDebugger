@@ -58,6 +58,12 @@ typedef struct _KND_DEVICE_CONTEXT {
     UINT32           CalloutIds[KND_MAX_CALLOUTS];  /* FwpsCalloutRegister ids */
     UINT32           NumCallouts;
     BOOLEAN          CalloutsRegistered;
+
+    /* ---- WFP transparent connect-redirect (-> local MITM proxy) ---- */
+    volatile LONG    RedirectEnable;
+    USHORT           RedirectPort;          /* host order */
+    HANDLE           RedirectHandle;        /* FwpsRedirectHandleCreate0 */
+    BOOLEAN          RedirectHandleCreated;
 } KND_DEVICE_CONTEXT, *PKND_DEVICE_CONTEXT;
 
 /* Single global context (one device). */

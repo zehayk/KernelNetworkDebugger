@@ -5,6 +5,9 @@
 #include "knd_client.h"
 #include "app_model.h"
 #include "mock.h"
+#include "settings.h"
+#include "knd_inject.h"
+#include <cstdio>
 
 #include "imgui.h"
 #include "imgui_impl_win32.h"
@@ -107,6 +110,22 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     const bool demoFromCmd = (lpCmdLine != nullptr && wcsstr(lpCmdLine, L"demo") != nullptr);
     const bool mitmFromCmd = (lpCmdLine != nullptr && wcsstr(lpCmdLine, L"mitm") != nullptr);
 
+    // Headless self-test: --inject <pid> delivers knd_sslkeys.dll into a process and
+    // writes the result to inject_result.txt (used to verify the injection mechanism).
+    if (lpCmdLine != nullptr && wcsstr(lpCmdLine, L"inject") != nullptr) {
+        const wchar_t* d = lpCmdLine;
+        while (*d != 0 && (*d < L'0' || *d > L'9')) { ++d; }
+        unsigned long pid = wcstoul(d, nullptr, 10);
+        std::string e;
+        bool ok = KndInject::InjectDll(pid, KndInject::DefaultDllPath().c_str(), e);
+        FILE* f = nullptr;
+        if (fopen_s(&f, "inject_result.txt", "wb") == 0 && f != nullptr) {
+            fprintf(f, "%s: %s\n", ok ? "OK" : "FAIL", e.c_str());
+            fclose(f);
+        }
+        return ok ? 0 : 1;
+    }
+
     ImGui_ImplWin32_EnableDpiAwareness();
 
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0, hInst, nullptr, nullptr,
@@ -134,6 +153,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
     io.IniFilename = "knetdbg_layout.ini";   // persist docking layout across runs
 
     AppState st;
+    KndSettings::Load(st);          // restore persisted user options
     st.mockData = demoFromCmd;
     Ui_ApplyTheme(st);
 
@@ -221,6 +241,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR lpCmdLine, int)
         g_pSwapChain->Present(1, 0);   // vsync
     }
 
+    KndSettings::Save(st);          // persist user options
     mitmProxy.stop();
     client.close();
     ImGui_ImplDX11_Shutdown();

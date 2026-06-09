@@ -27,6 +27,9 @@ public:
     bool stopCapture();
     bool getStats(KND_STATS_OUT& out);
 
+    // Enable/disable the driver's WFP transparent connect-redirect to the proxy.
+    bool setRedirect(bool enable, uint16_t proxyPort);
+
     // Scoped phys R/W over the driver's own cache region (offset, not a PA).
     bool physRead(uint64_t offset, void* buf, uint32_t len);
     bool physWrite(uint64_t offset, const void* buf, uint32_t len);

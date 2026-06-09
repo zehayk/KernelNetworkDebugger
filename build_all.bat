@@ -36,6 +36,7 @@ rem --- 3. stage outputs ---
 echo [3/3] staging dist\ ...
 if not exist "%ROOT%dist" mkdir "%ROOT%dist"
 copy /y "%ROOT%app\build\knetdbg.exe" "%ROOT%dist\" >nul
+if exist "%ROOT%app\build\knd_sslkeys.dll" copy /y "%ROOT%app\build\knd_sslkeys.dll" "%ROOT%dist\" >nul
 if exist "%ROOT%driver\knd.inf" copy /y "%ROOT%driver\knd.inf" "%ROOT%dist\" >nul
 if "%DRIVER_OK%"=="1" copy /y "%ROOT%driver\x64\Release\knd.sys" "%ROOT%dist\" >nul
 if exist "%ROOT%certificates\knetdbg_test.cer" copy /y "%ROOT%certificates\knetdbg_test.cer" "%ROOT%dist\" >nul

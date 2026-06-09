@@ -87,6 +87,15 @@ bool KndClient::getStats(KND_STATS_OUT& out)
     return ioctl(IOCTL_KND_GET_STATS, nullptr, 0, &out, sizeof(out), &ret) && ret == sizeof(out);
 }
 
+bool KndClient::setRedirect(bool enable, uint16_t proxyPort)
+{
+    KND_REDIRECT_IN in{};
+    in.enable = enable ? 1u : 0u;
+    in.proxyPort = proxyPort;
+    DWORD ret = 0;
+    return ioctl(IOCTL_KND_SET_REDIRECT, &in, sizeof(in), nullptr, 0, &ret);
+}
+
 bool KndClient::physRead(uint64_t offset, void* buf, uint32_t len)
 {
     if (len == 0 || len > KND_MAX_PHYS_RW) {

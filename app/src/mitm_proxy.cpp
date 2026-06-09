@@ -1,6 +1,7 @@
 // mitm_proxy.cpp - see mitm_proxy.h.
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <mstcpip.h>     // SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT
 
 #include "mitm_proxy.h"
 #include "mitm_ca.h"
@@ -103,6 +104,53 @@ static bool ParseConnect(const std::string& pre, std::string& host, uint16_t& po
     port = static_cast<uint16_t>(atoi(hp.c_str() + colon + 1));
     if (port == 0) { port = 443; }
     return true;
+}
+
+// Recover the original destination of a WFP-redirected (transparent) connection.
+static bool QueryOriginalDest(SOCKET s, KND_REDIRECT_CTX& out)
+{
+    BYTE buf[256];
+    DWORD bytes = 0;
+    if (WSAIoctl(s, SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT, nullptr, 0,
+                 buf, sizeof(buf), &bytes, nullptr, nullptr) != 0) {
+        return false;
+    }
+    if (bytes < sizeof(KND_REDIRECT_CTX)) { return false; }
+    memcpy(&out, buf, sizeof(out));
+    return true;
+}
+
+// Pull the SNI host_name from a peeked TLS ClientHello (returns "" if absent).
+static std::string ParseSni(const unsigned char* d, size_t n)
+{
+    if (n < 43 || d[0] != 0x16) { return ""; }
+    size_t p = 5;                                   // record header
+    if (p + 4 > n || d[p] != 0x01) { return ""; }   // handshake = ClientHello
+    p += 4 + 2 + 32;                                // hs header + version + random
+    if (p >= n) { return ""; }
+    p += 1 + d[p];                                  // session id
+    if (p + 2 > n) { return ""; }
+    p += 2 + ((d[p] << 8) | d[p + 1]);              // cipher suites
+    if (p >= n) { return ""; }
+    p += 1 + d[p];                                  // compression methods
+    if (p + 2 > n) { return ""; }
+    size_t extEnd = p + 2 + ((d[p] << 8) | d[p + 1]);
+    p += 2;
+    if (extEnd > n) { extEnd = n; }
+    while (p + 4 <= extEnd) {
+        uint16_t et = (uint16_t)((d[p] << 8) | d[p + 1]);
+        uint16_t el = (uint16_t)((d[p + 2] << 8) | d[p + 3]);
+        p += 4;
+        if (et == 0) {  // server_name: list_len(2) type(1) name_len(2) name
+            if (p + 5 <= extEnd) {
+                uint16_t nameLen = (uint16_t)((d[p + 3] << 8) | d[p + 4]);
+                if (p + 5 + nameLen <= extEnd) { return std::string((const char*)d + p + 5, nameLen); }
+            }
+            return "";
+        }
+        p += el;
+    }
+    return "";
 }
 
 // ------------------------------------------------------------------ proxy
@@ -214,22 +262,45 @@ void KndMitmProxy::handleConn(intptr_t clientFdIn)
     mbedtls_x509_crt_init(&leafChain); mbedtls_pk_init(&leafKey);
 
     bool opened = false;
-    std::string host; uint16_t port = 443;
+    std::string host;       // upstream connect target (CONNECT host or original IP)
+    std::string certHost;   // hostname the minted cert is issued for
+    uint16_t port = 443;
 
     do {
-        std::string pre;
-        if (!ReadPreamble(clientSock, pre)) { break; }
-        if (!ParseConnect(pre, host, port)) {
-            const char* resp = "HTTP/1.1 501 Not Implemented\r\n\r\n";
-            send(clientSock, resp, (int)strlen(resp), 0);
-            break;
+        char first = 0;
+        if (recv(clientSock, &first, 1, MSG_PEEK) != 1) { break; }
+        if ((unsigned char)first == 0x16) {
+            // Transparent WFP-redirected TLS connection: no CONNECT preamble.
+            // Take the cert host from SNI and the real destination from the driver.
+            unsigned char peek[2048];
+            int pn = recv(clientSock, (char*)peek, sizeof(peek), MSG_PEEK);
+            if (pn <= 0) { break; }
+            certHost = ParseSni(peek, (size_t)pn);
+            KND_REDIRECT_CTX rc;
+            if (!QueryOriginalDest(clientSock, rc)) { break; }
+            char ip[64];
+            _snprintf_s(ip, sizeof(ip), _TRUNCATE, "%u.%u.%u.%u",
+                        rc.origAddr[0], rc.origAddr[1], rc.origAddr[2], rc.origAddr[3]);
+            host = ip;
+            port = rc.origPort;
+            if (certHost.empty()) { certHost = host; }
+        } else {
+            // Explicit-proxy connection: "CONNECT host:port".
+            std::string pre;
+            if (!ReadPreamble(clientSock, pre)) { break; }
+            if (!ParseConnect(pre, host, port)) {
+                const char* resp = "HTTP/1.1 501 Not Implemented\r\n\r\n";
+                send(clientSock, resp, (int)strlen(resp), 0);
+                break;
+            }
+            const char* ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
+            send(clientSock, ok, (int)strlen(ok), 0);
+            certHost = host;
         }
-        const char* ok = "HTTP/1.1 200 Connection Established\r\n\r\n";
-        send(clientSock, ok, (int)strlen(ok), 0);
 
-        // mint cert for host
+        // mint cert for the target host
         MintedCert mc; std::string e;
-        if (!ca_->certForHost(host, mc, &e)) { break; }
+        if (!ca_->certForHost(certHost, mc, &e)) { break; }
         if (mbedtls_x509_crt_parse(&leafChain, (const unsigned char*)mc.certChainPem.c_str(),
                                    mc.certChainPem.size() + 1) != 0) { break; }
         if (mbedtls_pk_parse_key(&leafKey, (const unsigned char*)mc.keyPem.c_str(), mc.keyPem.size() + 1,
@@ -258,14 +329,14 @@ void KndMitmProxy::handleConn(intptr_t clientFdIn)
         mbedtls_ssl_conf_authmode(&upconf, MBEDTLS_SSL_VERIFY_NONE); // debugging proxy: never block
         mbedtls_ssl_conf_rng(&upconf, mbedtls_ctr_drbg_random, &rng);
         if (mbedtls_ssl_setup(&ssl_up, &upconf) != 0) { break; }
-        mbedtls_ssl_set_hostname(&ssl_up, host.c_str());
+        mbedtls_ssl_set_hostname(&ssl_up, certHost.c_str());
         mbedtls_ssl_set_bio(&ssl_up, &upstreamNet, mbedtls_net_send, mbedtls_net_recv, nullptr);
         while ((hs = mbedtls_ssl_handshake(&ssl_up)) != 0) {
             if (hs != MBEDTLS_ERR_SSL_WANT_READ && hs != MBEDTLS_ERR_SSL_WANT_WRITE) { break; }
         }
         if (hs != 0) { break; }
 
-        pushRecord(BuildConnOpen(flow, host, port));
+        pushRecord(BuildConnOpen(flow, certHost, port));
         opened = true;
 
         // non-blocking relay
